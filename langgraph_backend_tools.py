@@ -55,6 +55,7 @@ def get_stock_price(symbol: str) -> dict:
 # Initialize with your specific PDF path here
 pdf_manager = RAGPDF("Introduction to Machine Learning with Python.pdf")
 rag_tool = pdf_manager.get_tool()
+
 load_dotenv()
 
 model = ChatOpenAI(model = "gpt-4o-mini")

@@ -1,10 +1,12 @@
 import streamlit as st
-from langgraph_backend_tools import chatbot,retrieve_all_threads, GLOBAL_CONN
+from langgraph_backend_tools_async_MCP import chatbot,retrieve_all_threads, DB_PATH
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage,ToolMessage
 import uuid
 from langchain_openai import ChatOpenAI
 import time
 import sqlite3
+import asyncio
+import aiosqlite
 
 # ---------------------------- Utility functions -------------------------------
 def generate_thread_id():
@@ -26,7 +28,12 @@ def add_thread(thread_id,thread_title):
 def load_conversation(thread_id):
     # Returns messages of a particular thread_id
     CONFIG = {'configurable': {'thread_id' : thread_id}}
-    state = chatbot.get_state(config=CONFIG)
+    # Use asyncio.run to call the async aget_state
+    async def get_val():
+        state = await chatbot.aget_state(config=CONFIG)
+        return state
+    
+    state = asyncio.run(get_val())
     if not state.values or 'messages' not in state.values:
         return []
     return state.values['messages']
@@ -69,12 +76,24 @@ def delete_thread(thread_id):
     ]
     # Remove from DB
     #conn=sqlite3.connect('chatbot.db')
-    GLOBAL_CONN.execute("DELETE FROM thread_meta where thread_id = ?",(thread_id,))
-    GLOBAL_CONN.execute("DELETE FROM writes WHERE thread_id = ?",(thread_id,))
-    GLOBAL_CONN.commit()
-    #conn.close()
-    
+    async def _async_delete():
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Delete your custom title metadata
+            await db.execute("DELETE FROM thread_meta where thread_id = ?",(thread_id,))
+            # Delete LangGraph's internal checkpoint data
+            await db.execute("DELETE FROM checkpoints where thread_id = ?",(thread_id,))
+            # Delete LangGraph's internal intermediate writes
+            await db.execute("DELETE FROM writes where thread_id = ?",(thread_id,))
+            await db.commit()
+    # Run the cleanup bridge
+    asyncio.run(_async_delete())
 
+    # 3. Reset UI if the deleted thread was the one we were looking at
+    if st.session_state.get('thread_id') == thread_id:
+        reset_chat()
+    st.rerun()
+    
+    
     # Remove from LangGraph checkpoint storage (actual messages)
     clear_conversation(thread_id)
 
@@ -98,7 +117,7 @@ if 'thread_title' not in st.session_state:
     st.session_state['thread_title'] = "New Chat"
 
 if 'chat_threads' not in st.session_state:
-    st.session_state['chat_threads'] = retrieve_all_threads()
+    st.session_state['chat_threads'] = asyncio.run(retrieve_all_threads())
 
 if 'active_menu_thread' not in st.session_state:
     st.session_state['active_menu_thread'] = None
@@ -128,9 +147,14 @@ def format_messages(messages):
             
         elif isinstance(msg,AIMessage):
             # 1. Query metrics for THIS SPECIFIC message ID
-            cursor = GLOBAL_CONN.execute(
-                "SELECT tool_name, execution_time FROM tool_metrics_meta WHERE message_id = ?", (msg.id,))
-            rows = cursor.fetchall()
+            # Change format_messages metrics query
+            async def get_metrics(msg_id):
+                async with aiosqlite.connect(DB_PATH) as db:
+                    async with db.execute("SELECT tool_name, execution_time FROM tool_metrics_meta WHERE message_id = ?", (msg_id,)) as cursor:
+                        return await cursor.fetchall()
+
+            # Inside format_messages for msg in messages:
+            rows = asyncio.run(get_metrics(msg.id))
             msg_metrics = [{"Tool": r[0], "Time (s)": r[1]} for r in rows]
 
             if msg_metrics:
@@ -264,38 +288,43 @@ user_input=st.chat_input('Type here')
 
 
 # Print this to your command prompt/terminal to inspect the data
-print("\n--- Current Message History Debug ---")
-for idx, msg in enumerate(st.session_state['message_history']):
-    role = msg.get('role')
-    content = msg.get('content', '')[:50] # Show first 50 chars
-    has_tools = "Yes" if msg.get('tool_info') else "No"
+# print("\n--- Current Message History Debug ---")
+# for idx, msg in enumerate(st.session_state['message_history']):
+#     role = msg.get('role')
+#     content = msg.get('content', '')[:50] # Show first 50 chars
+#     has_tools = "Yes" if msg.get('tool_info') else "No"
     
-    print(f"Index: {idx} | Role: {role} | Tools Included: {has_tools} | Content: {content}...")
-print("-------------------------------------\n")
+#     print(f"Index: {idx} | Role: {role} | Tools Included: {has_tools} | Content: {content}...")
+# print("-------------------------------------\n")
 
 
 
 
 if user_input:
-    print("UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU")
+    # 1. Append user message to session state
     st.session_state['message_history'].append({'role':'user','content':user_input})
     new_thread_created=False
+
+    # 2. Handle New Chat title generation
     if(st.session_state['thread_title']=="New Chat"):
         title=generate_title(user_input)
         st.session_state['thread_title'] =  title
-        #st.session_state['chat_threads'][-1][st.session_state['thread_id']]=title
         add_thread(st.session_state['thread_id'],st.session_state['thread_title'] )
-        #conn=sqlite3.connect('chatbot.db')
-        GLOBAL_CONN.execute(
-            "INSERT OR REPLACE INTO thread_meta (thread_id,title) VALUES (?,?)",
-            (str(st.session_state['thread_id']),st.session_state['thread_title'])
-        )
-        GLOBAL_CONN.commit()
-        #conn.close()
+  
+        # Async Database call for thread metadata
+        async def save_thread_meta():
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO thread_meta (thread_id, title) VALUES (?, ?)",
+                    (str(st.session_state['thread_id']), st.session_state['thread_title'])
+                )
+                await db.commit()
+        asyncio.run(save_thread_meta())
         new_thread_created=True
     with st.chat_message('user'):
         st.markdown(user_input)
     
+    # 3. Setup LangGraph Config
     # CONFIG = {'configurable': {'thread_id' : st.session_state['thread_id']}}
     # Also includes langsmith tracing threadwise
     CONFIG = {'configurable': {'thread_id' : st.session_state['thread_id']},
@@ -305,12 +334,14 @@ if user_input:
               "run_name": "chat_turn"
               }
     
-  
+    # 4. Assistant Response Logic
     with st.chat_message('assistant'):
-        full_response = ""
+        response_data = {
+            "full_response": "",
+            "current_ai_msg_id": None # Track the ID of this specific response turn
+        }
         tool_metrics = [] # To store {tool_name, time_taken}
         active_tools = {} # To track start times: {tool_call_id: start_time}
-        current_ai_msg_id = None # Track the ID of this specific response turn
 
         # UI placeholder for status and main text
         tool_details_place_holder = st.empty()
@@ -318,30 +349,33 @@ if user_input:
         text_placeholder = st.empty()
 
 
-        # Streaming including tool events. # Initialize a single status container
-        with status_placeholder.status("Thinking...",expanded=False) as status_container:
-            t_name="tool"
-            for message_chunk,metadata in chatbot.stream(
+        # Define the async streaming logic
+        async def run_chatbot_async():
+            # Switch to astream to ensure the event loop stays open for MCP tools
+            async for message_chunk in chatbot.astream(
                     {'messages': [HumanMessage(content=user_input)]},
                     config=CONFIG,stream_mode='messages'
                 ):
+                # LangGraph message chunks can sometimes be tuples
+                msg = message_chunk[0] if isinstance(message_chunk, tuple) else message_chunk
 
-                # FIX: Capture the unique ID of the AI Message
-                if isinstance(message_chunk,AIMessage) and not current_ai_msg_id:
-                    current_ai_msg_id = message_chunk.id
-
+                # Capture the message ID for database logging
+                if isinstance(message_chunk,AIMessage) and not response_data["current_ai_msg_id"]:
+                    response_data["current_ai_msg_id"] = msg.id
+                # Tool Call Start (LLM decides to use a tool)
                 # 1. Capture Tool CALL (Start)
-                if isinstance(message_chunk,AIMessage) and message_chunk.tool_calls:
-                    for tool_call in message_chunk.tool_calls:
+                if isinstance(msg,AIMessage) and msg.tool_calls:
+                    for tool_call in msg.tool_calls:
                         t_name = tool_call['name']
                         t_id = tool_call['id']
                         active_tools[t_id] = {"name": t_name, "start": time.perf_counter()}
                         #status_placeholder.status(f"Running tool: **{t_name}**...")
-                        status_container.update(label = f"🛠️ Running tool: **{t_name}**...", state="running")
+                        status_container.update(label = f"🛠️ Running MCP/Tool: **{t_name}**...", state="running")
 
+                # Tool Result End (The tool has finished executing)
                 # 2. Capture Tool RESULT (End)
-                elif isinstance(message_chunk,ToolMessage):
-                    t_id = message_chunk.tool_call_id
+                elif isinstance(msg,ToolMessage):
+                    t_id = msg.tool_call_id
                     if t_id in active_tools:
                         t_name_actual = active_tools[t_id]["name"]
                         end_time = time.perf_counter()
@@ -351,32 +385,44 @@ if user_input:
                             "Time (s)": round(duration,3)
                         })
 
-                        # FIX: Persistent Save to DB linked to this Message ID
-                        GLOBAL_CONN.execute(
-                                "INSERT INTO tool_metrics_meta (thread_id, message_id, tool_name, execution_time) VALUES (?, ?, ?, ?)", 
-                                (st.session_state['thread_id'], current_ai_msg_id, t_name_actual, duration)
+                        # Async Save Metrics to DB
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "INSERT INTO tool_metrics_meta (thread_id, message_id, tool_name, execution_time) VALUES (?, ?, ?, ?)",
+                                (st.session_state['thread_id'], response_data["current_ai_msg_id"], t_name_actual, duration)
                             )
-                        GLOBAL_CONN.commit()
+                            await db.commit()
                         status_container.update(label = f"✅ Tool calls - ({t_name_actual}) completed", state = "running")
-                        #status_placeholder.empty() # Clear the status once done
 
-                # 3. Capture AI Text content
-                elif isinstance(message_chunk,AIMessage) and message_chunk.content:
-                    full_response += message_chunk.content
-                    text_placeholder.markdown(full_response)
+                 # 3. Capture AI Text content
+                 # Text Generation (Streaming the words)
+                elif isinstance(msg,AIMessage) and msg.content:
+                    response_data["full_response"] += msg.content
+                    text_placeholder.markdown(response_data["full_response"])
 
-            # Final status cleanup
+        # Initialize the status container and run the async bridge
+        # Streaming including tool events. # Initialize a single status container
+        with status_placeholder.status("Thinking...", expanded=False) as status_container:
+            asyncio.run(run_chatbot_async())
+
             status_container.update(label="Response generated", state="complete")
 
-        #Final Tool Summary (The "Small Link" functionality)
+        # 5. Final Tool Summary UI
         if tool_metrics:
-            with st.expander("🛠️ Tool ------ Details"):
+            with st.expander("🛠️ Tool Details"):
                 st.table(tool_metrics)
-
+    
     # Save to history with metrics
-    st.session_state['message_history'].append({'role':'assistant','content':full_response, 'tool_info':tool_metrics if tool_metrics else None})
+    st.session_state['message_history'].append({'role':'assistant','content':response_data["full_response"], 'tool_info':tool_metrics if tool_metrics else None})
+
     if 'new_thread_created' in locals() and new_thread_created:
         st.rerun()
+
+
+
+
+
+
 
     
 

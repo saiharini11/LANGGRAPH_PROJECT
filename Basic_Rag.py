@@ -9,7 +9,7 @@ from langchain_core.tools import tool
 class RAGPDF:
     def __init__(self, filepath:str):
         load_dotenv()
-        llm = ChatOpenAI(model = "gpt-4o-mini")
+        #llm = ChatOpenAI(model = "gpt-4o-mini")
 
         loader = PyPDFLoader(filepath)
         docs = loader.load()
@@ -39,7 +39,8 @@ class RAGPDF:
             result = self.retriever.invoke(query)
             context = [doc.page_content for doc in result]
             metadata = [doc.metadata for doc in result]
-
+            #print("RAG result:  --------------------------------------")
+            #print(result)
             return {
                 'query': query,
                 'context': context,
